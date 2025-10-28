@@ -17,7 +17,7 @@
     <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
-    <OutputPath>..\..\steam\steamapps\common\Escape from Duckov\Duckov_Data\Mods\ammo - 副本\</OutputPath>
+    <OutputPath>..\..\steam\steamapps\common\Escape from Duckov\Duckov_Data\Mods\sniper\</OutputPath>
     <DefineConstants>DEBUG;TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
