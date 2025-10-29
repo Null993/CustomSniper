@@ -18,7 +18,7 @@ namespace CustomSniper
         public float BulletDistanceMultiplier = 1.0f;  // 射程倍率（额外系数：基于原始值）
         public float AdsTimeMultiplier = 1.0f;         // 开镜时间倍率
         public float ScatterFactorMultiplier = 1.0f;   // 开镜散射倍率
-        public int PenetrationCount = 0;               // 穿墙次数（0=关闭，1-10=穿墙次数）
+        public bool Penetration = false;               // 穿墙
      
     }
 
@@ -41,7 +41,7 @@ namespace CustomSniper
     public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
         private static readonly string MOD_NAME = "SniperTweaks";
-        private static ModBehaviour Instance;
+        public static ModBehaviour Instance { get; private set; }
 
         private SniperConfig config = new SniperConfig();
 
@@ -55,33 +55,83 @@ namespace CustomSniper
         private TextMeshProUGUI _text;
 
         // ===== 穿墙功能相关字段 =====
-        private static readonly FieldInfo ProjectileHitLayersField =
-            typeof(Projectile).GetField("hitLayers", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly FieldInfo ProjectileDamagedObjectsField =
-            typeof(Projectile).GetField("damagedObjects", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly FieldInfo ProjectileDeadField =
-            typeof(Projectile).GetField("dead", BindingFlags.Instance | BindingFlags.NonPublic);
-
+        private static bool _enablePenetrationDebugLog = true;
+        
         private readonly HashSet<int> _penetratingProjectiles = new HashSet<int>();
-        private readonly Dictionary<int, Projectile> _penetratingProjectileRefs = new Dictionary<int, Projectile>();
+        private readonly Dictionary<int, WeakReference<Projectile>> _penetratingProjectileRefs = new Dictionary<int, WeakReference<Projectile>>();
         private readonly Dictionary<int, LayerMask> _originalProjectileMasks = new Dictionary<int, LayerMask>();
-        private readonly List<Projectile> _activeProjectiles = new List<Projectile>(128);
         private readonly HashSet<int> _activeProjectileIds = new HashSet<int>();
-
-        private CharacterMainControl _trackedCharacter;
+        private static FieldInfo _projectileHitLayersField;
+        private static FieldInfo _projectileContextField;
+        private readonly List<Projectile> _activeProjectiles = new List<Projectile>(128);
+        private ItemAgentHolder _trackedHolder;
         private ItemAgent_Gun _trackedGun;
-        private bool _penetrationActive = false;
+        private bool _holderEventsHooked;
+        private static readonly FieldInfo GunProjectileField = typeof(ItemAgent_Gun).GetField("projInst", BindingFlags.Instance | BindingFlags.NonPublic);
+        private static List<string> AllowedWeaponNames = new List<string>();
+
+        private static void Log(string message)
+        {
+            if (_enablePenetrationDebugLog)
+            {
+                Debug.Log("[自定义狙击枪穿墙组件] " + message);
+            }
+        }
+
+        private static void LogWarning(string message)
+        {
+            if (_enablePenetrationDebugLog)
+            {
+                Debug.LogWarning("[自定义狙击枪穿墙组件] " + message);
+            }
+        }
+
+        private static void LogError(string message)
+        {
+            if (_enablePenetrationDebugLog)
+            {
+                Debug.LogError("[自定义狙击枪穿墙组件] " + message);
+            }
+        }
 
         void Awake()
         {
             Instance = this;
+            Log("初始化中...");
+            _projectileHitLayersField = typeof(Projectile).GetField("hitLayers", BindingFlags.Instance | BindingFlags.NonPublic);
+            _projectileContextField = typeof(Projectile).GetField("context", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+            if (_projectileHitLayersField == null)
+                LogWarning("未找到 Projectile.hitLayers 字段。");
+            if (_projectileContextField == null)
+                LogWarning("未找到 Projectile.context 字段。");
+
+            foreach(int id in sniperIDs) 
+            {
+                Item prefab = ItemAssetsCollection.GetPrefab(id);
+
+                if (!AllowedWeaponNames.Contains(prefab.DisplayName))
+                {
+                    AllowedWeaponNames.Add(prefab.DisplayName);
+                    Log($"允许穿透的武器: {prefab.DisplayName} (ID={id})");
+                }
+                else { 
+                
+                }
+
+            }
+  
+           
         }
+
+
+        
 
         void OnEnable()
         {
             ModManager.OnModActivated += OnModActivated;
-            LevelManager.OnAfterLevelInitialized += OnLevelInitialized;
-
+            
+            LevelManager.OnAfterLevelInitialized += this.OnLevelInitialized;
             if (ModConfigAPI.IsAvailable())
             {
                 SetupConfigUI();
@@ -94,19 +144,16 @@ namespace CustomSniper
         void OnDisable()
         {
             ModManager.OnModActivated -= OnModActivated;
-            LevelManager.OnAfterLevelInitialized -= OnLevelInitialized;
+  
             ModConfigAPI.SafeRemoveOnOptionsChangedDelegate(OnConfigChanged);
 
             // 清理穿墙功能
-            SetPenetrationActive(false);
-            UnhookCharacterEvents();
-            RestorePenetratingProjectiles();
+            LevelManager.OnAfterLevelInitialized -= this.OnLevelInitialized;
 
-            _activeProjectiles.Clear();
-            _activeProjectileIds.Clear();
-            _penetratingProjectiles.Clear();
-            _penetratingProjectileRefs.Clear();
-            _originalProjectileMasks.Clear();
+            UnhookAgentHolder();
+            RestorePenetratingProjectiles();
+            Log("已禁用并恢复所有子弹。");
+
 
             if (_text != null)
             {
@@ -120,23 +167,338 @@ namespace CustomSniper
                 Instance = null;
             }
         }
-
-        void Update()
+        private void OnLevelInitialized()
         {
-            // 确保角色追踪
-            EnsureCharacterTracking();
 
-            // 维护穿透弹药
-            if (config.PenetrationCount > 0 && _penetrationActive)
+            CharacterMainControl main = CharacterMainControl.Main;
+            if (main != null)
             {
-                MaintainPenetratingProjectiles();
+                HookAgentHolder(main.agentHolder);
+                Log("已启用，等待射击事件...");
+            }
+            else
+            {
+                Log("main = null");
             }
         }
 
-        private void OnLevelInitialized()
+
+        // -------------------- 枪械挂钩逻辑 --------------------
+        private void HookAgentHolder(ItemAgentHolder holder)
         {
-            TryHookCharacter();
+            if (holder == null)
+            {
+                Log("holder == null");
+                return;
+            }
+            if (_trackedHolder == holder && _holderEventsHooked)
+            {
+                Log("_trackedHolder == holder && _holderEventsHooked");
+                return;
+            }
+
+            UnhookAgentHolder();
+            _trackedHolder = holder;
+            _trackedHolder.OnHoldAgentChanged += OnHoldAgentChanged;
+            _holderEventsHooked = true;
+
+            OnHoldAgentChanged(holder.CurrentHoldGun);
+            Log("已挂钩角色持枪事件。");
         }
+
+        private void UnhookAgentHolder()
+        {
+            if (_trackedHolder != null && _holderEventsHooked)
+            {
+                _trackedHolder.OnHoldAgentChanged -= OnHoldAgentChanged;
+                _holderEventsHooked = false;
+                _trackedHolder = null;
+            }
+
+            if (_trackedGun != null)
+            {
+                _trackedGun.OnShootEvent -= OnGunShoot;
+                _trackedGun = null;
+            }
+        }
+
+        private void OnHoldAgentChanged(DuckovItemAgent agent)
+        {
+            if (_trackedGun != null)
+                _trackedGun.OnShootEvent -= OnGunShoot;
+
+            _trackedGun = agent as ItemAgent_Gun;
+            if (_trackedGun != null)
+            {
+                _trackedGun.OnShootEvent += OnGunShoot;
+                Log($"当前持枪: {_trackedGun.Item.DisplayName}");
+            }
+        }
+
+        private sealed class ProjectileTrackerMarker : MonoBehaviour
+        {
+  
+        }
+
+        private void RegisterActiveProjectile(Projectile projectile)
+        {
+            if (projectile == null)
+            {
+                return;
+            }
+            int instanceID = projectile.GetInstanceID();
+            if (this._activeProjectileIds.Add(instanceID))
+            {
+                this._activeProjectiles.Add(projectile);
+            }
+        }
+
+        // Token: 0x060000B7 RID: 183 RVA: 0x00009114 File Offset: 0x00007314
+        private void UnregisterActiveProjectile(Projectile projectile)
+        {
+            if (projectile == null)
+            {
+                return;
+            }
+            int instanceID = projectile.GetInstanceID();
+            if (this._activeProjectileIds.Remove(instanceID))
+            {
+                this._activeProjectiles.Remove(projectile);
+            }
+        }
+
+
+        private sealed class ProjectileTracker : MonoBehaviour
+        {
+            // Token: 0x060000F0 RID: 240 RVA: 0x0000B4E8 File Offset: 0x000096E8
+            private void Awake()
+            {
+                this._projectile = base.GetComponent<Projectile>();
+            }
+
+            // Token: 0x060000F1 RID: 241 RVA: 0x0000B4F8 File Offset: 0x000096F8
+            private void OnEnable()
+            {
+                if (this._projectile == null)
+                {
+                    this._projectile = base.GetComponent<Projectile>();
+                }
+                ModBehaviour instance = ModBehaviour.Instance;
+                if (instance == null || this._projectile == null)
+                {
+                    return;
+                }
+                instance.RegisterActiveProjectile(this._projectile);
+            }
+
+            // Token: 0x060000F2 RID: 242 RVA: 0x0000B54C File Offset: 0x0000974C
+            private void OnDisable()
+            {
+                if (this._projectile == null)
+                {
+                    this._projectile = base.GetComponent<Projectile>();
+                }
+                ModBehaviour instance = ModBehaviour.Instance;
+                if (instance == null || this._projectile == null)
+                {
+                    return;
+                }
+                instance.UnregisterActiveProjectile(this._projectile);
+            }
+
+
+            private Projectile _projectile;
+        }
+
+        // -------------------- 开火事件 --------------------
+        private void OnGunShoot()
+        {
+  
+
+   
+            if (!config.Penetration || !AllowedWeaponNames.Contains(_trackedGun.Item.DisplayName))
+            {
+                return;
+            }
+ 
+            try
+            {
+                if (_trackedGun == null) return;
+                Projectile projectile = CaptureImmediateProjectile(_trackedGun);
+                if (projectile == null)
+                {
+                    LogWarning("未捕获到发射的Projectile。");
+                    return;
+                }
+
+                Log($"捕获发射子弹: {projectile.name}, ID={projectile.GetInstanceID()}");
+                ApplyPenetration(projectile);
+            }
+            catch (Exception e)
+            {
+                LogError("OnGunShoot 出错: " + e);
+            }
+        }
+
+        // -------------------- 捕获当前发射的子弹 --------------------
+        private Projectile CaptureImmediateProjectile(ItemAgent_Gun gun)
+        {
+            if (ModBehaviour.GunProjectileField == null)
+            {
+                return null;
+            }
+            Projectile result;
+            try
+            {
+                Projectile projectile = ModBehaviour.GunProjectileField.GetValue(gun) as Projectile;
+                if (projectile == null)
+                {
+                    result = null;
+                }
+                else
+                {
+                    this.EnsureProjectilePoolTracked(projectile);
+                    this.EnsureProjectileTracker(projectile);
+                    result = projectile;
+                }
+            }
+            catch
+            {
+                result = null;
+            }
+            return result;
+        }
+        private void EnsureProjectilePoolTracked(Projectile projectile)
+        {
+            if (projectile == null)
+            {
+                return;
+            }
+            Transform parent = projectile.transform.parent;
+            if (parent == null)
+            {
+                return;
+            }
+            if (parent.GetComponent<ModBehaviour.ProjectileTrackerMarker>() != null)
+            {
+                return;
+            }
+            parent.gameObject.AddComponent<ModBehaviour.ProjectileTrackerMarker>();
+            Projectile[] componentsInChildren = parent.GetComponentsInChildren<Projectile>(true);
+            for (int i = 0; i < componentsInChildren.Length; i++)
+            {
+                this.EnsureProjectileTracker(componentsInChildren[i]);
+            }
+        }
+        private void EnsureProjectileTracker(Projectile projectile)
+        {
+            if (projectile == null)
+            {
+                return;
+            }
+            if (projectile.GetComponent<ModBehaviour.ProjectileTracker>() != null)
+            {
+                return;
+            }
+            projectile.gameObject.AddComponent<ModBehaviour.ProjectileTracker>();
+        }
+
+
+        // -------------------- 应用穿透 --------------------
+        private void ApplyPenetration(Projectile projectile)
+        {
+            if (projectile == null || _projectileHitLayersField == null) return;
+            int id = projectile.GetInstanceID();
+
+            try
+            {
+                // 保存原始掩码
+                if (!_originalProjectileMasks.ContainsKey(id))
+                {
+                    LayerMask mask = (LayerMask)_projectileHitLayersField.GetValue(projectile);
+                    _originalProjectileMasks[id] = mask;
+                }
+
+                // 获取并修改 context
+                object context = _projectileContextField?.GetValue(projectile);
+                if (context != null)
+                {
+                    Type type = context.GetType();
+                    FieldInfo ignoreHalf = type.GetField("ignoreHalfObsticle");
+                    FieldInfo penetrate = type.GetField("penetrate");
+
+                    if (ignoreHalf != null) ignoreHalf.SetValue(context, true);
+                    if (penetrate != null)
+                    {
+                        int value = (int)penetrate.GetValue(context);
+                        penetrate.SetValue(context, Mathf.Max(value, 6));
+                    }
+                }
+
+                ConfigureProjectileHitMask(projectile);
+                _penetratingProjectiles.Add(id);
+                _penetratingProjectileRefs[id] = new WeakReference<Projectile>(projectile);
+
+                Log($"子弹 {projectile.name} 已启用穿透。");
+            }
+            catch (Exception e)
+            {
+                LogError("ApplyPenetration 出错: " + e);
+            }
+        }
+
+        // -------------------- 修改掩码 --------------------
+        private void ConfigureProjectileHitMask(Projectile projectile)
+        {
+            try
+            {
+                int targetMask = GameplayDataSettings.Layers.damageReceiverLayerMask.value;
+                int blockMask = GameplayDataSettings.Layers.wallLayerMask.value |
+                                GameplayDataSettings.Layers.groundLayerMask.value |
+                                GameplayDataSettings.Layers.halfObsticleLayer.value;
+                targetMask &= ~blockMask;
+
+                LayerMask newMask = new LayerMask { value = targetMask };
+                _projectileHitLayersField?.SetValue(projectile, newMask);
+                Log($"修改掩码为: {newMask.value}");
+            }
+            catch (Exception e)
+            {
+                LogWarning("设置掩码失败: " + e);
+            }
+        }
+
+        // -------------------- 恢复逻辑 --------------------
+        private void RestorePenetratingProjectiles()
+        {
+            Log("恢复所有子弹掩码...");
+            foreach (int id in _penetratingProjectiles)
+            {
+                if (_penetratingProjectileRefs.TryGetValue(id, out var weakRef)
+                    && weakRef.TryGetTarget(out var proj)
+                    && proj != null)
+                {
+                    if (_originalProjectileMasks.TryGetValue(id, out LayerMask mask))
+                    {
+                        _projectileHitLayersField?.SetValue(proj, mask);
+
+                        object ctx = _projectileContextField?.GetValue(proj);
+                        if (ctx != null)
+                        {
+                            FieldInfo ignoreHalf = ctx.GetType().GetField("ignoreHalfObsticle");
+                            if (ignoreHalf != null) ignoreHalf.SetValue(ctx, false);
+                        }
+
+                        Log($"恢复子弹 {proj.name} 掩码。");
+                    }
+                }
+            }
+
+            _penetratingProjectiles.Clear();
+            _penetratingProjectileRefs.Clear();
+            _originalProjectileMasks.Clear();
+        }
+    
 
         private void OnModActivated(ModInfo info, Duckov.Modding.ModBehaviour behaviour)
         {
@@ -170,22 +532,27 @@ namespace CustomSniper
             ModConfigAPI.SafeAddInputWithSlider(
                 MOD_NAME, "AdsTimeMultiplier",
                 zh ? "开镜时间倍率" : "ADS Time Multiplier",
-                typeof(float), config.AdsTimeMultiplier, new Vector2(0.5f, 2f)
+                typeof(float), config.AdsTimeMultiplier, new Vector2(0.2f, 2f)
             );
 
             // 开镜散射倍率
             ModConfigAPI.SafeAddInputWithSlider(
                 MOD_NAME, "ScatterFactorMultiplier",
                 zh ? "开镜散射倍率" : "ADS Scatter Multiplier",
-                typeof(float), config.ScatterFactorMultiplier, new Vector2(0.5f, 2f)
+                typeof(float), config.ScatterFactorMultiplier, new Vector2(0.2f, 2f)
             );
 
             // 穿墙次数
-            ModConfigAPI.SafeAddInputWithSlider(
-                MOD_NAME, "PenetrationCount",
-                zh ? "穿墙次数" : "Wall Penetration Count",
-                typeof(int), config.PenetrationCount, new Vector2(0, 10)
-            );
+            //ModConfigAPI.SafeAddInputWithSlider(
+            //    MOD_NAME, "Penetration",
+            //    zh ? "穿墙" : "Wall Penetration",
+            //    typeof(bool), config.Penetration, new Vector2(0, 10)
+            //);
+            //public static bool SafeAddBoolDropdownList(string modName, string key, string description, bool defaultValue)
+            ModConfigAPI.SafeAddBoolDropdownList(
+                MOD_NAME, "Penetration",
+                zh ? "穿墙" : "Wall Penetration",
+                config.Penetration);
 
             Debug.Log($"[{MOD_NAME}] Config UI ready with penetration control.");
         }
@@ -205,7 +572,7 @@ namespace CustomSniper
             config.BulletDistanceMultiplier = ModConfigAPI.SafeLoad<float>(MOD_NAME, "BulletDistanceMultiplier", config.BulletDistanceMultiplier);
             config.AdsTimeMultiplier = ModConfigAPI.SafeLoad<float>(MOD_NAME, "AdsTimeMultiplier", config.AdsTimeMultiplier);
             config.ScatterFactorMultiplier = ModConfigAPI.SafeLoad<float>(MOD_NAME, "ScatterFactorMultiplier", config.ScatterFactorMultiplier);
-            config.PenetrationCount = ModConfigAPI.SafeLoad<int>(MOD_NAME, "PenetrationCount", config.PenetrationCount);
+            config.Penetration = ModConfigAPI.SafeLoad<bool>(MOD_NAME, "Penetration", config.Penetration);
         }
 
         private void ApplyTweaks()
@@ -274,386 +641,7 @@ namespace CustomSniper
   
         }
 
-        // ===== 穿墙功能实现 =====
 
-        private void EnsureCharacterTracking()
-        {
-            CharacterMainControl main = CharacterMainControl.Main;
-            if (main == null)
-            {
-                if (_trackedCharacter != null)
-                {
-                    UnhookCharacterEvents();
-                }
-                return;
-            }
 
-            if (_trackedCharacter != main)
-            {
-                TryHookCharacter();
-            }
-        }
-
-        private void TryHookCharacter()
-        {
-            CharacterMainControl main = CharacterMainControl.Main;
-            if (main == null) return;
-
-            if (_trackedCharacter != main)
-            {
-                UnhookCharacterEvents();
-                _trackedCharacter = main;
-            }
-
-            HookGunEvents(main);
-        }
-
-        private void HookGunEvents(CharacterMainControl character)
-        {
-            if (character == null || character.agentHolder == null) return;
-
-            ItemAgent_Gun gun = character.agentHolder.CurrentHoldGun;
-            if (gun != _trackedGun)
-            {
-                if (_trackedGun != null)
-                {
-                    _trackedGun.OnShootEvent -= OnGunShoot;
-                }
-
-                _trackedGun = gun;
-
-                if (_trackedGun != null)
-                {
-                    _trackedGun.OnShootEvent += OnGunShoot;
-                }
-            }
-        }
-
-        private void UnhookCharacterEvents()
-        {
-            if (_trackedGun != null)
-            {
-                _trackedGun.OnShootEvent -= OnGunShoot;
-            }
-            _trackedGun = null;
-            _trackedCharacter = null;
-        }
-
-        private void OnGunShoot()
-        {
-            if (config.PenetrationCount <= 0 || _trackedGun == null) return;
-
-            // 检查是否是狙击枪
-            if (_trackedGun.Item != null)
-            {
-                bool isSniper = Array.Exists(sniperIDs, id => id == _trackedGun.Item.TypeID);
-                if (!isSniper) return;
-            }
-
-            bool hasPenetratingProjectiles = _penetratingProjectiles.Count > 0;
-            SetPenetrationActive(hasPenetratingProjectiles || config.PenetrationCount > 0);
-
-            if (_penetrationActive)
-            {
-                EnsureShotPenetration(_trackedCharacter);
-            }
-        }
-
-        private void EnsureShotPenetration(CharacterMainControl shooter)
-        {
-            if (config.PenetrationCount <= 0 || !_penetrationActive) return;
-            if (shooter == null || _activeProjectiles.Count == 0) return;
-
-            for (int i = 0; i < _activeProjectiles.Count; i++)
-            {
-                Projectile projectile = _activeProjectiles[i];
-                if (projectile != null && projectile.context.fromCharacter == shooter)
-                {
-                    TryApplyObstaclePenetration(projectile);
-                }
-            }
-        }
-
-        private void TryApplyObstaclePenetration(Projectile projectile)
-        {
-            if (config.PenetrationCount <= 0 || !_penetrationActive) return;
-
-            try
-            {
-                int instanceID = projectile.GetInstanceID();
-                bool isAlreadyPenetrating = _penetratingProjectiles.Contains(instanceID);
-
-                if (config.PenetrationCount > 0 || isAlreadyPenetrating)
-                {
-                    bool isExplosive = IsExplosiveProjectile(projectile);
-                    LayerMask? originalMask = null;
-
-                    // 保存原始遮罩
-                    if (ProjectileHitLayersField != null && !_originalProjectileMasks.ContainsKey(instanceID))
-                    {
-                        object value = ProjectileHitLayersField.GetValue(projectile);
-                        if (value is LayerMask)
-                        {
-                            originalMask = (LayerMask)value;
-                        }
-                    }
-
-                    // 设置穿透属性
-                    projectile.context.ignoreHalfObsticle = true;
-
-                    if (isExplosive)
-                    {
-                        projectile.context.penetrate = Math.Min(projectile.context.penetrate, 0);
-                    }
-                    else
-                    {
-                        projectile.context.penetrate = Math.Max(projectile.context.penetrate, config.PenetrationCount);
-                    }
-
-                    ConfigureProjectileHitMask(projectile);
-                    RegisterPenetratingProjectile(projectile, originalMask);
-                    EnsureDamagedObjectsInitialized(projectile);
-
-                    if (isExplosive)
-                    {
-                        ClampExplosiveProjectileState(projectile);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[{MOD_NAME}] 应用穿透失败: {ex.Message}");
-            }
-        }
-
-        private void ConfigureProjectileHitMask(Projectile projectile)
-        {
-            if (ProjectileHitLayersField == null) return;
-
-            try
-            {
-                int mask = GameplayDataSettings.Layers.damageReceiverLayerMask.value;
-                int obstacleMask = GameplayDataSettings.Layers.wallLayerMask.value |
-                                   GameplayDataSettings.Layers.groundLayerMask.value |
-                                   GameplayDataSettings.Layers.halfObsticleLayer.value;
-
-                mask &= ~obstacleMask;
-
-                if (mask == 0)
-                {
-                    int damageReceiverLayer = LayerMask.NameToLayer("DamageReceiver");
-                    if (damageReceiverLayer >= 0) mask |= 1 << damageReceiverLayer;
-
-                    int headColliderLayer = LayerMask.NameToLayer("HeadCollider");
-                    if (headColliderLayer >= 0) mask |= 1 << headColliderLayer;
-                }
-
-                LayerMask layerMask = new LayerMask { value = mask };
-                ProjectileHitLayersField.SetValue(projectile, layerMask);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[{MOD_NAME}] 配置遮罩失败: {ex.Message}");
-            }
-        }
-
-        private static bool IsExplosiveProjectile(Projectile projectile)
-        {
-            if (projectile == null) return false;
-
-            ProjectileContext context = projectile.context;
-            if (context.explosionRange > 0.01f || context.explosionDamage > 0.01f)
-                return true;
-
-            string name = projectile.name;
-            return !string.IsNullOrEmpty(name) &&
-                   name.IndexOf("rocket", StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
-        private static void ClampExplosiveProjectileState(Projectile projectile)
-        {
-            if (projectile != null && projectile.context.penetrate > 0)
-            {
-                projectile.context.penetrate = 0;
-            }
-        }
-
-        private void RegisterPenetratingProjectile(Projectile projectile, LayerMask? originalMask)
-        {
-            if (projectile == null) return;
-
-            int instanceID = projectile.GetInstanceID();
-            _penetratingProjectiles.Add(instanceID);
-            _penetratingProjectileRefs[instanceID] = projectile;
-
-            if (originalMask.HasValue && !_originalProjectileMasks.ContainsKey(instanceID))
-            {
-                _originalProjectileMasks[instanceID] = originalMask.Value;
-            }
-        }
-
-        private void EnsureDamagedObjectsInitialized(Projectile projectile)
-        {
-            if (ProjectileDamagedObjectsField == null) return;
-
-            try
-            {
-                var list = ProjectileDamagedObjectsField.GetValue(projectile) as List<GameObject>;
-                if (list != null)
-                {
-                    for (int i = list.Count - 1; i >= 0; i--)
-                    {
-                        GameObject obj = list[i];
-                        if (obj == null || obj.GetComponent<DamageReceiver>() == null)
-                        {
-                            list.RemoveAt(i);
-                        }
-                    }
-                }
-            }
-            catch { }
-        }
-
-        private void MaintainPenetratingProjectiles()
-        {
-            if (_penetratingProjectiles.Count == 0) return;
-
-            foreach (int id in _penetratingProjectiles.ToArray())
-            {
-                if (!_penetratingProjectileRefs.TryGetValue(id, out Projectile projectile) ||
-                    !IsProjectileActive(projectile))
-                {
-                    _penetratingProjectiles.Remove(id);
-                    _penetratingProjectileRefs.Remove(id);
-                    _originalProjectileMasks.Remove(id);
-                }
-            }
-        }
-
-        private void SetPenetrationActive(bool active)
-        {
-            if (_penetrationActive == active) return;
-
-            _penetrationActive = active;
-
-            if (!active)
-            {
-                RestorePenetratingProjectiles();
-            }
-        }
-
-        private void RestorePenetratingProjectiles()
-        {
-            if (_penetratingProjectiles.Count == 0)
-            {
-                _penetratingProjectileRefs.Clear();
-                _originalProjectileMasks.Clear();
-                return;
-            }
-
-            foreach (int id in _penetratingProjectiles.ToArray())
-            {
-                if (!_penetratingProjectileRefs.TryGetValue(id, out Projectile projectile) ||
-                    projectile == null)
-                {
-                    _penetratingProjectiles.Remove(id);
-                    _penetratingProjectileRefs.Remove(id);
-                    _originalProjectileMasks.Remove(id);
-                }
-                else
-                {
-                    try
-                    {
-                        if (_originalProjectileMasks.TryGetValue(id, out LayerMask mask) &&
-                            ProjectileHitLayersField != null)
-                        {
-                            ProjectileHitLayersField.SetValue(projectile, mask);
-                        }
-                        projectile.context.ignoreHalfObsticle = false;
-                    }
-                    catch { }
-                }
-            }
-
-            _penetratingProjectiles.Clear();
-            _originalProjectileMasks.Clear();
-            _penetratingProjectileRefs.Clear();
-        }
-
-        private static bool IsProjectileActive(Projectile projectile)
-        {
-            if (projectile == null) return false;
-            if (projectile.gameObject == null || !projectile.gameObject.activeInHierarchy)
-                return false;
-
-            if (ProjectileDeadField != null)
-            {
-                try
-                {
-                    if ((bool)ProjectileDeadField.GetValue(projectile))
-                        return false;
-                }
-                catch { }
-            }
-
-            return true;
-        }
-
-        public void RegisterActiveProjectile(Projectile projectile)
-        {
-            if (projectile == null) return;
-
-            int id = projectile.GetInstanceID();
-            if (_activeProjectileIds.Add(id))
-            {
-                _activeProjectiles.Add(projectile);
-            }
-        }
-
-        public void UnregisterActiveProjectile(Projectile projectile)
-        {
-            if (projectile == null) return;
-
-            int id = projectile.GetInstanceID();
-            if (_activeProjectileIds.Remove(id))
-            {
-                _activeProjectiles.Remove(projectile);
-            }
-        }
-
-        // ProjectileTracker 组件
-        public class ProjectileTracker : MonoBehaviour
-        {
-            private Projectile _projectile;
-
-            private void Awake()
-            {
-                _projectile = GetComponent<Projectile>();
-            }
-
-            private void OnEnable()
-            {
-                if (_projectile == null)
-                    _projectile = GetComponent<Projectile>();
-
-                ModBehaviour instance = Instance;
-                if (instance != null && _projectile != null)
-                {
-                    instance.RegisterActiveProjectile(_projectile);
-                }
-            }
-
-            private void OnDisable()
-            {
-                if (_projectile == null)
-                    _projectile = GetComponent<Projectile>();
-
-                ModBehaviour instance = Instance;
-                if (instance != null && _projectile != null)
-                {
-                    instance.UnregisterActiveProjectile(_projectile);
-                }
-            }
-        }
     }
 }
