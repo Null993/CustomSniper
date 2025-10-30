@@ -69,7 +69,7 @@ namespace CustomSniper
         private bool _holderEventsHooked;
         private static readonly FieldInfo GunProjectileField = typeof(ItemAgent_Gun).GetField("projInst", BindingFlags.Instance | BindingFlags.NonPublic);
         private static List<string> AllowedWeaponNames = new List<string>();
-
+        private static bool _configRegistered = false;
         private static void Log(string message)
         {
             if (_enablePenetrationDebugLog)
@@ -140,6 +140,18 @@ namespace CustomSniper
           
             }
         }
+
+        protected override void OnAfterSetup()
+        {
+            if (ModConfigAPI.IsAvailable())
+            {
+                SetupConfigUI();
+                LoadConfig();
+                ApplyTweaks();
+                
+            }
+        }
+
 
         void OnDisable()
         {
@@ -513,7 +525,7 @@ namespace CustomSniper
 
         private void SetupConfigUI()
         {
-            if (!ModConfigAPI.IsAvailable()) return;
+            if (!ModConfigAPI.IsAvailable() || _configRegistered) return;
 
             ModConfigAPI.SafeAddOnOptionsChangedDelegate(OnConfigChanged);
 
@@ -554,6 +566,7 @@ namespace CustomSniper
                 zh ? "穿墙" : "Wall Penetration",
                 config.Penetration);
 
+            _configRegistered = true;
             Debug.Log($"[{MOD_NAME}] Config UI ready with penetration control.");
         }
 
@@ -633,15 +646,6 @@ namespace CustomSniper
                 }
             }
         }
-
-
-        protected override void OnAfterSetup()
-        {
-            ApplyTweaks();
-  
-        }
-
-
 
     }
 }
