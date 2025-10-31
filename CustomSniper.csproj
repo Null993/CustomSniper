@@ -31,6 +31,11 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="0Harmony, Version=2.3.3.0, Culture=neutral, processorArchitecture=MSIL">
+      <SpecificVersion>False</SpecificVersion>
+      <HintPath>..\..\steam\steamapps\workshop\content\3167020\3589088839\0Harmony.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="ItemStatsSystem">
       <HintPath>..\..\steam\steamapps\common\Escape from Duckov\Duckov_Data\Managed\ItemStatsSystem.dll</HintPath>
       <Private>False</Private>

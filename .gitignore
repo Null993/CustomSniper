@@ -24,3 +24,9 @@ obj/Debug/DesignTimeResolveAssemblyReferencesInput.cache
 .vs/CustomSniper/copilot-chat/d631e9fd/sessions/5e52acbc-c033-4089-934c-ca38cceb0864
 BulletPenetrationMod.cs
 .vs/CustomSniper/FileContentIndex/6e5b0761-9643-4ba3-b1fe-7c45b20d9876.vsidx
+*.db
+*.vsidx
+.vs/CustomSniper/CopilotIndices/17.14.1368.60722/SemanticSymbols.db-wal
+.vs/CustomSniper/CopilotIndices/17.14.1368.60722/SemanticSymbols.db-shm
+.vs/CustomSniper/CopilotIndices/17.14.1368.60722/CodeChunks.db-wal
+.vs/CustomSniper/CopilotIndices/17.14.1368.60722/CodeChunks.db-shm

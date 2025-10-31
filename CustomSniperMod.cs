@@ -1,15 +1,18 @@
 ﻿using Duckov.Modding;
 using Duckov.Options;
 using Duckov.Utilities;
+
 using ItemStatsSystem;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using TMPro;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
-
+using HarmonyLib;
 namespace CustomSniper
 {
     [Serializable]
@@ -19,7 +22,9 @@ namespace CustomSniper
         public float AdsTimeMultiplier = 1.0f;         // 开镜时间倍率
         public float ScatterFactorMultiplier = 1.0f;   // 开镜散射倍率
         public bool Penetration = false;               // 穿墙
-     
+        public string BL_SniperIDs = "";
+        public string WL_SniperIDs = ""; // 白名单ID列表
+
     }
 
     public static class ReflectionHelper
@@ -38,25 +43,31 @@ namespace CustomSniper
         }
     }
 
+
     public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
-        private static readonly string MOD_NAME = "SniperTweaks";
+
+        private static readonly string MOD_NAME = "CustomSniper";
         public static ModBehaviour Instance { get; private set; }
 
         private SniperConfig config = new SniperConfig();
 
         // 狙击枪ID列表（按需修改）
-        private readonly int[] sniperIDs = { 246, 407, 780, 781, 782 };
+        //private int[] sniperIDs = { 246, 407, 780, 781, 782 };
+        private HashSet<int> sniperIDs = new HashSet<int>();
+        private HashSet<int> bl_sniperIDs = new HashSet<int>();
+        private HashSet<int> wl_sniperIDs = new HashSet<int>();
+        private HashSet<int> real_sniperIDs = new HashSet<int>();
 
         // 缓存每个武器的原始参数（避免重复叠加）
         private Dictionary<int, (float dist, float ads, float scatter)> _originalValues
-            = new Dictionary<int, (float dist, float ads, float scatter)>();
+                = new Dictionary<int, (float dist, float ads, float scatter)>();
 
         private TextMeshProUGUI _text;
 
         // ===== 穿墙功能相关字段 =====
         private static bool _enablePenetrationDebugLog = true;
-        
+
         private readonly HashSet<int> _penetratingProjectiles = new HashSet<int>();
         private readonly Dictionary<int, WeakReference<Projectile>> _penetratingProjectileRefs = new Dictionary<int, WeakReference<Projectile>>();
         private readonly Dictionary<int, LayerMask> _originalProjectileMasks = new Dictionary<int, LayerMask>();
@@ -68,9 +79,50 @@ namespace CustomSniper
         private ItemAgent_Gun _trackedGun;
         private bool _holderEventsHooked;
         private static readonly FieldInfo GunProjectileField = typeof(ItemAgent_Gun).GetField("projInst", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static List<string> AllowedWeaponNames = new List<string>();
+        //private static HashSet<string> AllowedWeaponNames = new HashSet<string>();
         private static bool _configRegistered = false;
-        private static void Log(string message)
+        private static List<string> targetCarlibers = new List<string> { "SNP", "MAG" };
+        private static int distHash;
+        private static int adsHash;
+        private static int scatterHash;
+
+
+
+
+        public static bool EvaluateFilter(ItemMetaData metaData, ItemFilter filter)
+        {
+
+            // 口径匹配
+            if (!string.IsNullOrEmpty(filter.caliber))
+            {
+                if (!string.Equals(metaData.caliber, filter.caliber, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+            return true;
+        }
+
+
+        public static int[] GetAllTypeIds(ItemFilter filter)
+        {
+            if (ItemAssetsCollection.Instance == null)
+                return null;
+
+            IEnumerable<int> collection = from e in ItemAssetsCollection.Instance.entries
+                                          where EvaluateFilter(e.metaData, filter)
+                                          select e.typeID;
+
+            var traverse = Traverse.Create(ItemAssetsCollection.Instance);
+            var dynamicDic = traverse.Field("dynamicDic").GetValue<IDictionary<int, ItemAssetsCollection.DynamicEntry>>();
+
+            IEnumerable<int> range = from e in dynamicDic
+                                     where e.Value?.prefab != null && EvaluateFilter(e.Value.MetaData, filter)
+                                     select e.Key;
+
+            HashSet<int> hashSet = new HashSet<int>(collection);
+            hashSet.UnionWith(range);
+            return hashSet.ToArray();
+        }
+        public static void Log(string message)
         {
             if (_enablePenetrationDebugLog)
             {
@@ -78,7 +130,7 @@ namespace CustomSniper
             }
         }
 
-        private static void LogWarning(string message)
+        public static void LogWarning(string message)
         {
             if (_enablePenetrationDebugLog)
             {
@@ -86,7 +138,7 @@ namespace CustomSniper
             }
         }
 
-        private static void LogError(string message)
+        public static void LogError(string message)
         {
             if (_enablePenetrationDebugLog)
             {
@@ -94,10 +146,129 @@ namespace CustomSniper
             }
         }
 
-        void Awake()
+
+        public static string GetCaliber(Item item)
         {
-            Instance = this;
+            if (item == null)
+            {
+                return null;
+            }
+            CustomDataCollection constants = item.Constants;
+            if (constants == null)
+            {
+                return null;
+            }
+            return constants.GetString("Caliber".GetHashCode(), null);
+        }
+
+        public Item find_gun(int id)
+        {
+            Item prefab = ItemAssetsCollection.GetPrefab(id);
+            if (prefab == null)
+            {
+                var traverse = Traverse.Create(ItemAssetsCollection.Instance);
+                var dynamicDic = traverse.Field("dynamicDic").GetValue<IDictionary<int, ItemAssetsCollection.DynamicEntry>>();
+
+                if (dynamicDic.TryGetValue(id, out var entry))
+                {
+                    ItemMetaData metaData = Traverse.Create(entry).Field("MetaData").GetValue<ItemMetaData>();
+
+                    if (entry.prefab == null)
+                    {
+                        Log($"entry.prefab == null");
+                    }
+                    else
+                    {
+                        prefab = entry.prefab;
+                    }
+                }
+            }
+            return prefab;
+        }
+        public void updata_weapons(int distHash, int adsHash, int scatterHash)
+        {
+
+            foreach (int id in real_sniperIDs)
+            {
+                Item prefab = find_gun(id);
+                if (prefab == null)
+                {
+                    Debug.LogWarning($"[{MOD_NAME}] Missing item prefab: {id}");
+                    continue;
+                }
+
+                try
+                {
+                    // 如果未缓存原始值，先读取并缓存
+                    if (!_originalValues.ContainsKey(id))
+                    {
+                        float originalDist = prefab.GetStat(distHash).BaseValue;
+                        float originalAds = prefab.GetStat(adsHash).BaseValue;
+                        float originalScatter = prefab.GetStat(scatterHash).BaseValue;
+
+                        _originalValues[id] = (originalDist, originalAds, originalScatter);
+
+                        Debug.Log($"[{MOD_NAME}] 缓存原始值 ID={id}: Dist={originalDist}, ADS={originalAds}, Scatter={originalScatter}");
+                    }
+
+                    var orig = _originalValues[id];
+
+                    // 始终以缓存的原始值作为基准，乘以配置里的系数
+                    float newDist = orig.dist * config.BulletDistanceMultiplier;
+                    float newAds = orig.ads * config.AdsTimeMultiplier;
+                    float newScatter = orig.scatter * config.ScatterFactorMultiplier;
+
+                    prefab.GetStat(distHash).BaseValue = newDist;
+                    prefab.GetStat(adsHash).BaseValue = newAds;
+                    prefab.GetStat(scatterHash).BaseValue = newScatter;
+
+                    Debug.Log($"[{MOD_NAME}] ID={id} updated: Dist={orig.dist}->{newDist}, ADS={orig.ads}->{newAds}, Scatter={orig.scatter}->{newScatter}");
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning($"[{MOD_NAME}] Update failed for item {id}: {e.Message}");
+                }
+            }
+        }
+        public void updata_Real_SniperIDs(HashSet<int> sniperIDs, HashSet<int> bl_sniperIDs, HashSet<int> wl_sniperIDs)
+        {
+            real_sniperIDs = new HashSet<int>(sniperIDs.Except(bl_sniperIDs));
+            // 添加白名单中的武器（无视类型和黑名单）
+            foreach (int id in wl_sniperIDs)
+            {
+                if (!real_sniperIDs.Contains(id))
+                {
+                    real_sniperIDs.Add(id);
+                    Log($"[白名单] 强制允许武器 ID={id}");
+                }
+            }
+            foreach (int id in real_sniperIDs)
+            {
+                Item prefab = find_gun(id);
+                if (prefab == null)
+                {
+                    LogWarning($"[RealSniper] 找不到ID={id}的Prefab");
+                    continue;
+                }
+                CustomDataCollection constants = prefab.Constants;
+                Log($"{prefab.DisplayName}:{constants.GetString("Caliber".GetHashCode(), null)}");
+
+                if (!real_sniperIDs.Contains(prefab.TypeID))
+                {
+
+                    real_sniperIDs.Add(prefab.TypeID);
+                    Log($"新增允许穿透的武器: {prefab.DisplayName} (ID={id})");
+                }
+      
+
+            }
+        }
+
+        private void Awake()
+        {
             Log("初始化中...");
+            Instance = this;
+            
             _projectileHitLayersField = typeof(Projectile).GetField("hitLayers", BindingFlags.Instance | BindingFlags.NonPublic);
             _projectileContextField = typeof(Projectile).GetField("context", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
@@ -106,39 +277,165 @@ namespace CustomSniper
             if (_projectileContextField == null)
                 LogWarning("未找到 Projectile.context 字段。");
 
-            foreach(int id in sniperIDs) 
-            {
-                Item prefab = ItemAssetsCollection.GetPrefab(id);
 
-                if (!AllowedWeaponNames.Contains(prefab.DisplayName))
+
+            //// 构建CSV
+            //StringBuilder sb = new StringBuilder();
+            //sb.AppendLine("ID,名称,口径");
+
+            //foreach (int id in tempids)
+            //{
+            //    string carliber = GetCaliber(ItemAssetsCollection.GetPrefab(id));
+            //    Debug.Log($"[{id}] {ItemAssetsCollection.GetPrefab(id).DisplayName}: {carliber}");
+
+            //    //string name = .Replace(",", "，");
+            //    //string caliber = carliber.Replace(",", "，");
+
+            //    //sb.AppendLine($"{id},{ItemAssetsCollection.GetPrefab(id).DisplayName},{carliber}");
+            //}
+            //// 导出为 CSV
+            //string savePath = Path.Combine(Application.persistentDataPath, "WeaponList.csv");
+            //File.WriteAllText(savePath, sb.ToString(), new UTF8Encoding(true));
+
+            // 通过反射拿到哈希（如果类型/字段不存在会抛异常）
+
+            try
+            {
+                distHash = ReflectionHelper.GetStaticFieldValue<int>(typeof(ItemAgent_Gun), "BulletDistanceHash");
+                adsHash = ReflectionHelper.GetStaticFieldValue<int>(typeof(ItemAgent_Gun), "AdsTimeHash");
+                scatterHash = ReflectionHelper.GetStaticFieldValue<int>(typeof(ItemAgent_Gun), "ScatterFactorHashADS");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[{MOD_NAME}] 反射读取哈希失败: {e.Message}");
+                return;
+            }
+
+            foreach (string targetCaliber in targetCarlibers)
+            {
+                try
                 {
-                    AllowedWeaponNames.Add(prefab.DisplayName);
-                    Log($"允许穿透的武器: {prefab.DisplayName} (ID={id})");
+                    //Log("调试点1");
+
+                    ItemFilter filter = new ItemFilter();
+                    filter.caliber = targetCaliber;
+
+
+
+
+                    // 获取所有匹配类型 id
+                    int[] tempids = GetAllTypeIds(filter);
+                   
+                    
+                    if (tempids == null)
+                    {
+                        LogWarning($"GetAllTypeIds returned null for caliber {targetCaliber}");
+                        continue;
+                    }
+                    foreach (int id in tempids)
+
+                    {
+                        try
+                        {
+                            var prefab = ItemAssetsCollection.GetPrefab(id);
+                            if (prefab == null)
+                            {
+                                var traverse = Traverse.Create(ItemAssetsCollection.Instance);
+                                var dynamicDic = traverse.Field("dynamicDic").GetValue<IDictionary<int, ItemAssetsCollection.DynamicEntry>>();
+
+                                if (dynamicDic.TryGetValue(id, out var entry))
+                                {
+                                    ItemMetaData metaData = Traverse.Create(entry).Field("MetaData").GetValue<ItemMetaData>();
+     
+                                    if (entry.prefab == null)
+                                    {
+                                        Log($"entry.prefab == null");
+                                    }
+                                    else {
+                                        prefab = entry.prefab;
+                                        Log($"发现可能不是原版的武器: {entry.prefab.DisplayName}");                                    
+                                    }
+                        
+                                }
+                            }
+     
+
+                            if (prefab == null)
+                            {
+                                LogWarning($"ItemAssetsCollection.GetPrefab({id}) 返回 null");
+                                continue;
+                            }
+
+                            if (prefab.Tags == null)
+                            {
+                                LogWarning($"Prefab [{id}] {prefab.DisplayName} 的 Tags 为 null");
+                                continue;
+                            }
+
+                            
+                            
+                            bool _isgun = false;
+                            foreach (Tag tag in prefab.Tags)
+                            {
+                                try
+                                {
+                                    if (tag == null)
+                                    {
+                                        LogWarning($"Prefab [{id}] {prefab.DisplayName} 的某个 tag 为 null");
+                                        continue;
+                                    }
+
+                                    
+                                    if (prefab.Tags.Contains("Gun"))
+                                    {
+                                        _isgun = true;
+                                        sniperIDs.Add(id);
+                                    }
+                                }
+                                catch (Exception e)
+                                {
+                                    LogWarning($"遍历 tag 时出错 id={id}, tag={tag?.ToString() ?? "null"}: {e.Message}");
+                                }
+                            }
+                            if (_isgun)
+                            {
+                                Log($"Find Gun: [{id}] {prefab.DisplayName}");
+                            }
+                            
+
+                        }
+                        catch (Exception e)
+                        {
+                            LogWarning($"遍历 prefab id={id} 出错: {e.Message}");
+                        }
+                    }
                 }
-                else { 
-                
+                catch (Exception e)
+                {
+                    LogWarning($"处理 caliber={targetCaliber} 时出错: {e.Message}\n{e.StackTrace}");
                 }
+
 
             }
-  
-           
+
+
         }
 
 
-        
 
-        void OnEnable()
+
+        private void OnEnable()
         {
             ModManager.OnModActivated += OnModActivated;
-            
+
             LevelManager.OnAfterLevelInitialized += this.OnLevelInitialized;
-            if (ModConfigAPI.IsAvailable())
-            {
-                SetupConfigUI();
-                LoadConfig();
-                ApplyTweaks();
-          
-            }
+            //if (ModConfigAPI.IsAvailable())
+            //{
+            //    SetupConfigUI();
+            //    LoadConfig();
+            //    ApplyTweaks();
+
+            //}
         }
 
         protected override void OnAfterSetup()
@@ -148,15 +445,15 @@ namespace CustomSniper
                 SetupConfigUI();
                 LoadConfig();
                 ApplyTweaks();
-                
+
             }
         }
 
 
-        void OnDisable()
+        private void OnDisable()
         {
             ModManager.OnModActivated -= OnModActivated;
-  
+
             ModConfigAPI.SafeRemoveOnOptionsChangedDelegate(OnConfigChanged);
 
             // 清理穿墙功能
@@ -249,7 +546,7 @@ namespace CustomSniper
 
         private sealed class ProjectileTrackerMarker : MonoBehaviour
         {
-  
+
         }
 
         private void RegisterActiveProjectile(Projectile projectile)
@@ -325,14 +622,14 @@ namespace CustomSniper
         // -------------------- 开火事件 --------------------
         private void OnGunShoot()
         {
-  
 
-   
-            if (!config.Penetration || !AllowedWeaponNames.Contains(_trackedGun.Item.DisplayName))
+
+
+            if (!config.Penetration || !real_sniperIDs.Contains(_trackedGun.Item.TypeID))
             {
                 return;
             }
- 
+
             try
             {
                 if (_trackedGun == null) return;
@@ -510,7 +807,7 @@ namespace CustomSniper
             _penetratingProjectileRefs.Clear();
             _originalProjectileMasks.Clear();
         }
-    
+
 
         private void OnModActivated(ModInfo info, Duckov.Modding.ModBehaviour behaviour)
         {
@@ -519,7 +816,7 @@ namespace CustomSniper
                 SetupConfigUI();
                 LoadConfig();
                 ApplyTweaks();
-         
+
             }
         }
 
@@ -531,7 +828,7 @@ namespace CustomSniper
 
             bool zh = Application.systemLanguage.ToString().StartsWith("Chinese");
 
-  
+
 
             // 子弹射程倍率（额外系数）
             ModConfigAPI.SafeAddInputWithSlider(
@@ -552,6 +849,22 @@ namespace CustomSniper
                 MOD_NAME, "ScatterFactorMultiplier",
                 zh ? "开镜散射倍率" : "ADS Scatter Multiplier",
                 typeof(float), config.ScatterFactorMultiplier, new Vector2(0.2f, 2f)
+            );
+            // 武器黑名单（逗号分隔ID）
+            ModConfigAPI.SafeAddInputWithSlider(
+                MOD_NAME,
+                "BlacklistIDs",
+                zh ? "武器黑名单（英文逗号分隔ID）" : "Weapon Blacklist (comma-separated IDs)",
+                typeof(string),
+                "" // 默认值为空
+            );
+            // 武器白名单（逗号分隔ID）
+            ModConfigAPI.SafeAddInputWithSlider(
+                MOD_NAME,
+                "WhitelistIDs",
+                zh ? "武器白名单（英文逗号分隔ID）" : "Weapon Whitelist (comma-separated IDs)",
+                typeof(string),
+                "" // 默认值为空
             );
 
             // 穿墙次数
@@ -575,7 +888,7 @@ namespace CustomSniper
             if (!key.StartsWith(MOD_NAME + "_")) return;
             LoadConfig();
             ApplyTweaks();
-    
+
             Debug.Log($"[{MOD_NAME}] Config changed: {key}");
         }
 
@@ -586,66 +899,53 @@ namespace CustomSniper
             config.AdsTimeMultiplier = ModConfigAPI.SafeLoad<float>(MOD_NAME, "AdsTimeMultiplier", config.AdsTimeMultiplier);
             config.ScatterFactorMultiplier = ModConfigAPI.SafeLoad<float>(MOD_NAME, "ScatterFactorMultiplier", config.ScatterFactorMultiplier);
             config.Penetration = ModConfigAPI.SafeLoad<bool>(MOD_NAME, "Penetration", config.Penetration);
+            config.BL_SniperIDs = ModConfigAPI.SafeLoad<string>(MOD_NAME, "BlacklistIDs", config.BL_SniperIDs);
+            config.WL_SniperIDs = ModConfigAPI.SafeLoad<string>(MOD_NAME, "WhitelistIDs", config.WL_SniperIDs);
+
+
+            // ✅ 读取黑名单并解析
+            bl_sniperIDs.Clear();
+
+            if (!string.IsNullOrWhiteSpace(config.BL_SniperIDs))
+            {
+                string[] parts = config.BL_SniperIDs.Split(new[] { ',', '，', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (string p in parts)
+                {
+                    if (int.TryParse(p.Trim(), out int id))
+                        bl_sniperIDs.Add(id);
+                }
+                Log($"已加载黑名单，共 {bl_sniperIDs.Count} 个ID: {string.Join(", ", bl_sniperIDs)}");
+            }
+            else
+            {
+                Log("未配置武器黑名单。");
+            }
+            // ✅ 白名单加载
+            wl_sniperIDs.Clear();
+            if (!string.IsNullOrWhiteSpace(config.WL_SniperIDs))
+            {
+                string[] parts = config.WL_SniperIDs.Split(new[] { ',', '，', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (string p in parts)
+                {
+                    if (int.TryParse(p.Trim(), out int id))
+                        wl_sniperIDs.Add(id);
+                }
+                Log($"已加载白名单，共 {wl_sniperIDs.Count} 个ID: {string.Join(", ", wl_sniperIDs)}");
+            }
+            else
+            {
+                Log("未配置武器白名单。");
+            }
+
+            updata_Real_SniperIDs(sniperIDs,bl_sniperIDs,wl_sniperIDs);
+            updata_weapons(distHash, adsHash, scatterHash);
         }
 
         private void ApplyTweaks()
         {
-            // 通过反射拿到哈希（如果类型/字段不存在会抛异常）
-            int distHash, adsHash, scatterHash;
-            try
-            {
-                distHash = ReflectionHelper.GetStaticFieldValue<int>(typeof(ItemAgent_Gun), "BulletDistanceHash");
-                adsHash = ReflectionHelper.GetStaticFieldValue<int>(typeof(ItemAgent_Gun), "AdsTimeHash");
-                scatterHash = ReflectionHelper.GetStaticFieldValue<int>(typeof(ItemAgent_Gun), "ScatterFactorHashADS");
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"[{MOD_NAME}] 反射读取哈希失败: {e.Message}");
-                return;
-            }
-
-            foreach (int id in sniperIDs)
-            {
-                Item prefab = ItemAssetsCollection.GetPrefab(id);
-                if (prefab == null)
-                {
-                    Debug.LogWarning($"[{MOD_NAME}] Missing item prefab: {id}");
-                    continue;
-                }
-
-                try
-                {
-                    // 如果未缓存原始值，先读取并缓存
-                    if (!_originalValues.ContainsKey(id))
-                    {
-                        float originalDist = prefab.GetStat(distHash).BaseValue;
-                        float originalAds = prefab.GetStat(adsHash).BaseValue;
-                        float originalScatter = prefab.GetStat(scatterHash).BaseValue;
-
-                        _originalValues[id] = (originalDist, originalAds, originalScatter);
-
-                        Debug.Log($"[{MOD_NAME}] 缓存原始值 ID={id}: Dist={originalDist}, ADS={originalAds}, Scatter={originalScatter}");
-                    }
-
-                    var orig = _originalValues[id];
-
-                    // 始终以缓存的原始值作为基准，乘以配置里的系数
-                    float newDist = orig.dist * config.BulletDistanceMultiplier;
-                    float newAds = orig.ads * config.AdsTimeMultiplier;
-                    float newScatter = orig.scatter * config.ScatterFactorMultiplier;
-
-                    prefab.GetStat(distHash).BaseValue = newDist;
-                    prefab.GetStat(adsHash).BaseValue = newAds;
-                    prefab.GetStat(scatterHash).BaseValue = newScatter;
-
-                    Debug.Log($"[{MOD_NAME}] ID={id} updated: Dist={orig.dist}->{newDist}, ADS={orig.ads}->{newAds}, Scatter={orig.scatter}->{newScatter}");
-                }
-                catch (Exception e)
-                {
-                    Debug.LogWarning($"[{MOD_NAME}] Update failed for item {id}: {e.Message}");
-                }
-            }
+            updata_weapons(distHash,adsHash ,scatterHash);
         }
 
     }
+
 }
